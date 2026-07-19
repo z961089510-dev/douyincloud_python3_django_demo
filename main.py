@@ -10,39 +10,27 @@ app = FastAPI(title="DYGUESS 2.0 Relay")
 ws_clients: set[WebSocket] = set()
 
 
-def find_msg_type(obj, depth=0):
-    """递归查找消息类型字段，兼容各种嵌套结构"""
-    if depth > 5 or not isinstance(obj, dict):
-        return None
-    for key in ("msg_type", "event", "event_type", "type", "method", "Type", "Event", "MsgType"):
-        if key in obj:
-            return obj[key]
-    for v in obj.values():
-        if isinstance(v, dict):
-            r = find_msg_type(v, depth + 1)
-            if r:
-                return r
-    return None
-
-
-def find_data(obj, depth=0):
-    """递归查找真正的消息体（跳过外层包装）"""
-    if depth > 5 or not isinstance(obj, dict):
-        return obj
-    for key in ("data", "payload", "message", "msg", "body", "Data", "Payload", "Message"):
-        if key in obj and isinstance(obj[key], (dict, list)):
-            return find_data(obj[key], depth + 1)
-    return obj
+def detect_msg_type(data: dict) -> str:
+    """根据字段特征判断消息类型"""
+    if data.get("content"):
+        return "chat"
+    if data.get("gift_num") is not None:
+        return "gift"
+    if data.get("like_num") is not None:
+        return "like"
+    if data.get("enter_room_type") == 1:
+        return "enter"
+    if data.get("enter_room_type") == 2:
+        return "leave"
+    return "unknown"
 
 
 async def broadcast(message):
     dead = set()
     payload = json.dumps(message, ensure_ascii=False)
     for ws in ws_clients:
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.add(ws)
+        try: await ws.send_text(payload)
+        except: dead.add(ws)
     if dead:
         ws_clients.difference_update(dead)
         logger.info(f"清理 {len(dead)} 个断开的 WS 连接，剩余 {len(ws_clients)}")
@@ -55,33 +43,16 @@ async def health():
 
 @app.post("/callback")
 async def callback(request: Request):
-    """兼容单条对象和数组两种回调格式，自动提取嵌套消息"""
     body = await request.body()
-    raw_body = body.decode("utf-8", errors="replace")
-    logger.info(f"===== 收到回调 原始body: {raw_body[:500]} =====")
-
-    try:
-        raw = json.loads(body)
-    except json.JSONDecodeError as e:
-        logger.error(f"回调数据不是合法 JSON: {e}")
-        raise HTTPException(400, detail="invalid json")
-
+    try: raw = json.loads(body)
+    except: raise HTTPException(400, detail="invalid json")
     items = raw if isinstance(raw, list) else [raw]
     forwarded = 0
-
     for item in items:
-        logger.info(f"条目完整JSON: {json.dumps(item, ensure_ascii=False)[:500]}")
-        msg_type = find_msg_type(item) or "unknown"
-        data = find_data(item)
-        if not isinstance(data, dict):
-            data = item
-        logger.info(f"识别: type={msg_type}, data_keys={list(data.keys())[:10]}")
-
-        # 组装成标准化格式再转发
-        normalized = {"msg_type": msg_type, "data": data}
-        await broadcast(normalized)
+        msg_type = detect_msg_type(item)
+        logger.info(f"回调 type={msg_type} user={item.get('nickname','?')}")
+        await broadcast({"msg_type": msg_type, "data": item})
         forwarded += 1
-
     return {"ok": True, "forwarded": forwarded}
 
 
@@ -93,10 +64,8 @@ async def ws_endpoint(ws: WebSocket):
     try:
         while True:
             d = await ws.receive_text()
-            if d.strip() == "ping":
-                await ws.send_text("pong")
-    except Exception:
-        pass
+            if d.strip() == "ping": await ws.send_text("pong")
+    except: pass
     finally:
         ws_clients.discard(ws)
         logger.info(f"WS 客户端断开，剩余 {len(ws_clients)}")
